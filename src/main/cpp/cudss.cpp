@@ -32,6 +32,22 @@
 #define CUDSS_CHECK(x) do { cudssStatus_t s_ = (x); if (s_ != CUDSS_STATUS_SUCCESS) { \
     throw std::runtime_error("cuDSS error, status " + std::to_string((int) s_)); } } while (0)
 
+// cuDSS 0.8.0 replaced the cudaDataType_t matrix-type parameters with its own
+// cudssDataType_t enums AND gave cudssMatrixCreateCsr a third type parameter
+// (offsetType, indexType, valueType — previously indexType, valueType only).
+// Build against either; the built-against version must match the libcudss.so.0
+// loaded at RUNTIME, which is shared process-wide (e.g. with open-loadflow's
+// libolfgpu) — a mixed-version process fails with CUDSS_STATUS_INVALID_VALUE.
+static_assert(CUDSS_VERSION >= 701,
+              "libmathcudss requires cuDSS >= 0.7.1 (CUDSS_VERSION >= 701)");
+#if CUDSS_VERSION >= 800
+#  define MATH_CUDSS_CSR_TYPES  CUDSS_R_32I, CUDSS_R_32I, CUDSS_R_64F   // offsetType, indexType, valueType
+#  define MATH_CUDSS_DN_TYPE    CUDSS_R_64F                             // valueType
+#else
+#  define MATH_CUDSS_CSR_TYPES  CUDA_R_32I, CUDA_R_64F                  // indexType, valueType (no offsetType)
+#  define MATH_CUDSS_DN_TYPE    CUDA_R_64F
+#endif
+
 namespace {
 
 // Number of iterative-refinement steps. cuDSS default pivoting leaves ~1e-3
@@ -61,8 +77,8 @@ public:
         if (matB == nullptr || rhsRows != rows || rhsCols != cols) {
             if (matB) { cudssMatrixDestroy(matB); matB = nullptr; }
             if (matX) { cudssMatrixDestroy(matX); matX = nullptr; }
-            CUDSS_CHECK(cudssMatrixCreateDn(&matB, rows, cols, rows, d_b, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR));
-            CUDSS_CHECK(cudssMatrixCreateDn(&matX, rows, cols, rows, d_x, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR));
+            CUDSS_CHECK(cudssMatrixCreateDn(&matB, rows, cols, rows, d_b, MATH_CUDSS_DN_TYPE, CUDSS_LAYOUT_COL_MAJOR));
+            CUDSS_CHECK(cudssMatrixCreateDn(&matX, rows, cols, rows, d_x, MATH_CUDSS_DN_TYPE, CUDSS_LAYOUT_COL_MAJOR));
             rhsRows = rows;
             rhsCols = cols;
         }
@@ -187,7 +203,7 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JN
         // CSC of M passed as CSR => cuDSS factorizes N = M^T (see file header).
         CUDSS_CHECK(cudssMatrixCreateCsr(&ctx.matA, ctx.n, ctx.n, ctx.nnz,
                                          ctx.d_ap, nullptr, ctx.d_ai, ctx.d_ax,
-                                         CUDSS_R_32I, CUDSS_R_32I, CUDSS_R_64F,
+                                         MATH_CUDSS_CSR_TYPES,
                                          CUDSS_MTYPE_GENERAL, CUDSS_MVIEW_FULL, CUDSS_BASE_ZERO));
         ctx.ensureRhs(ctx.n, 1);
 
