@@ -11,18 +11,21 @@
  * KLU implementation in lu.cpp. Built into a SEPARATE shared library
  * (libmathcudss) so the CUDA dependency never touches the CPU-only libmath.
  *
- * Matrix convention (see docs/cudss-integration.md section 6): the (ap, ai, ax)
- * arrays are the CSC of a matrix M (powsybl SparseMatrix layout). They are fed
- * to cuDSS AS CSR, so cuDSS factorizes N = M^T. A plain cuDSS solve therefore
- * computes M^T x = b, i.e. solve(transpose=true) == solveTransposed, which is
- * the path open-loadflow uses. cuDSS has no transpose solve, so the (unused on
- * sparse) non-transposed solve throws.
+ * Matrix convention: the (ap, ai, ax) arrays are the CSC of a matrix M (powsybl
+ * SparseMatrix layout). They are fed to cuDSS AS CSR, so cuDSS factorizes
+ * N = M^T. A plain cuDSS solve therefore computes M^T x = b, i.e.
+ * solve(transpose=true) == solveTransposed, which is the path open-loadflow
+ * uses. cuDSS has no transpose solve, so the (unused on sparse) non-transposed
+ * solve throws.
  */
+#include <algorithm>
+#include <limits>
 #include <string>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 #include <cuda_runtime.h>
 #include <cudss.h>
 #include "jniwrapper.hpp"
@@ -47,24 +50,48 @@ public:
 
     // ensure the rhs/solution device buffers and dense matrices match (rows, cols)
     void ensureRhs(int rows, int cols) {
-        int needed = rows * cols;
+        size_t needed = static_cast<size_t>(rows) * static_cast<size_t>(cols);
         if (needed > rhsCapacity) {
+            // Invalidate every piece of dependent state BEFORE the calls that can
+            // throw. Otherwise a failed cudaMalloc (GPU OOM) would leave a stale
+            // rhsCapacity next to a null d_b, and matB/matX bound to freed device
+            // memory, so a later solve would fault instead of retrying cleanly.
+            if (matB) { cudssMatrixDestroy(matB); matB = nullptr; }
+            if (matX) { cudssMatrixDestroy(matX); matX = nullptr; }
             if (d_b) { cudaFree(d_b); d_b = nullptr; }
             if (d_x) { cudaFree(d_x); d_x = nullptr; }
+            rhsCapacity = 0;
+            rhsRows = 0;
+            rhsCols = 0;
             CUDA_CHECK(cudaMalloc(&d_b, needed * sizeof(double)));
             CUDA_CHECK(cudaMalloc(&d_x, needed * sizeof(double)));
             rhsCapacity = needed;
-            // buffers moved, force matrix recreation
-            if (matB) { cudssMatrixDestroy(matB); matB = nullptr; }
-            if (matX) { cudssMatrixDestroy(matX); matX = nullptr; }
         }
-        if (matB == nullptr || rhsRows != rows || rhsCols != cols) {
+        if (matB == nullptr || matX == nullptr || rhsRows != rows || rhsCols != cols) {
             if (matB) { cudssMatrixDestroy(matB); matB = nullptr; }
             if (matX) { cudssMatrixDestroy(matX); matX = nullptr; }
+            rhsRows = 0;
+            rhsCols = 0;
             CUDSS_CHECK(cudssMatrixCreateDn(&matB, rows, cols, rows, d_b, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR));
             CUDSS_CHECK(cudssMatrixCreateDn(&matX, rows, cols, rows, d_x, CUDSS_R_64F, CUDSS_LAYOUT_COL_MAJOR));
             rhsRows = rows;
             rhsCols = cols;
+        }
+    }
+
+    // The refactorization path reuses the sparsity pattern captured at init, so an
+    // update that silently changed it would apply the new values to the wrong
+    // positions. Comparing nonzero counts alone does not catch a pattern change
+    // that preserves nnz (e.g. a topology change), hence the full comparison.
+    void checkSameStructure(const int* newAp, size_t apLength, const int* newAi, size_t aiLength) const {
+        if (apLength != hostAp.size() || aiLength != hostAi.size()) {
+            throw std::runtime_error("Matrix structure changed since initial decomposition "
+                                     "(nonzero count differs)");
+        }
+        if (!std::equal(hostAp.begin(), hostAp.end(), newAp) ||
+            !std::equal(hostAi.begin(), hostAi.end(), newAi)) {
+            throw std::runtime_error("Matrix structure changed since initial decomposition "
+                                     "(sparsity pattern differs)");
         }
     }
 
@@ -95,9 +122,11 @@ public:
     double* d_ax = nullptr;
     double* d_b = nullptr;
     double* d_x = nullptr;
+    std::vector<int> hostAp;  // sparsity pattern captured at init, to validate update()
+    std::vector<int> hostAi;
     int n = 0;
     int nnz = 0;
-    int rhsCapacity = 0;
+    size_t rhsCapacity = 0;
     int rhsRows = 0;
     int rhsCols = 0;
 };
@@ -134,13 +163,40 @@ private:
 
 std::unique_ptr<CuDssContextManager> MANAGER(new CuDssContextManager());
 
+// cuDSS signals a zero pivot through CUDSS_DATA_INFO while cudssExecute itself
+// still returns CUDSS_STATUS_SUCCESS, so checking the status is not enough to
+// notice a singular matrix. The caller must have synchronized the stream first.
+int getInfo(CuDssContext& ctx) {
+    int info = 0;
+    size_t written = 0;
+    CUDSS_CHECK(cudssDataGet(ctx.handle, ctx.data, CUDSS_DATA_INFO, &info, sizeof(info), &written));
+    return info;
+}
+
+// Mirrors the KLU backend, which throws on KLU_SINGULAR rather than handing back a
+// silently unusable factorization.
+void checkInfo(CuDssContext& ctx, const char* phase) {
+    int info = getInfo(ctx);
+    if (info != 0) {
+        throw std::runtime_error(std::string(phase) + " error, matrix is singular (cuDSS info "
+                                 + std::to_string(info) + ")");
+    }
+}
+
 void solveInto(CuDssContext& ctx, double* host, int rows, int cols, bool transpose) {
     if (!transpose) {
         throw std::runtime_error("cuDSS backend supports only the transposed solve "
                                  "(non-transposed sparse solve is not implemented)");
     }
+    if (rows != ctx.n) {
+        throw std::runtime_error("Right-hand side size " + std::to_string(rows) +
+                                 " does not match matrix order " + std::to_string(ctx.n));
+    }
+    if (cols <= 0) {
+        throw std::runtime_error("Invalid number of right-hand sides: " + std::to_string(cols));
+    }
     ctx.ensureRhs(rows, cols);
-    int total = rows * cols;
+    size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
     CUDA_CHECK(cudaMemcpyAsync(ctx.d_b, host, total * sizeof(double), cudaMemcpyHostToDevice, ctx.stream));
     CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_SOLVE, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
     CUDA_CHECK(cudaMemcpyAsync(host, ctx.d_x, total * sizeof(double), cudaMemcpyDeviceToHost, ctx.stream));
@@ -159,15 +215,29 @@ extern "C" {
  * Signature: (Ljava/lang/String;[I[I[D)V
  */
 JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JNIEnv* env, jobject, jstring j_id, jintArray j_ap, jintArray j_ai, jdoubleArray j_ax) {
+    std::string id;
+    bool created = false;
     try {
-        std::string id = powsybl::jni::StringUTF(env, j_id).toStr();
+        id = powsybl::jni::StringUTF(env, j_id).toStr();
         powsybl::jni::IntArray ap(env, j_ap);
         powsybl::jni::IntArray ai(env, j_ai);
         powsybl::jni::DoubleArray ax(env, j_ax);
 
+        if (ap.length() < 1) {
+            throw std::runtime_error("Invalid column pointer array: at least one element expected");
+        }
+        if (ai.length() != ax.length()) {
+            throw std::runtime_error("Row index array (" + std::to_string(ai.length()) +
+                                     ") and value array (" + std::to_string(ax.length()) +
+                                     ") must have the same length");
+        }
+
         CuDssContext& ctx = MANAGER->createContext(id);
+        created = true;
         ctx.n = static_cast<int>(ap.length()) - 1;
         ctx.nnz = static_cast<int>(ax.length());
+        ctx.hostAp.assign(ap.get(), ap.get() + ap.length());
+        ctx.hostAi.assign(ai.get(), ai.get() + ai.length());
 
         CUDA_CHECK(cudaStreamCreate(&ctx.stream));
         CUDSS_CHECK(cudssCreate(&ctx.handle));
@@ -194,9 +264,20 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JN
         CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_ANALYSIS, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
         CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_FACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        checkInfo(ctx, "cuDSS factorization");
     } catch (const std::exception& e) {
+        // Drop the half-built context: it holds a stream, a cuDSS handle and device
+        // allocations that nothing else would ever free (Java will not call release
+        // after a failed init), and leaving it registered would make every retry with
+        // the same id fail with "already exists" instead of reporting the real error.
+        if (created) {
+            MANAGER->removeContext(id);
+        }
         powsybl::jni::throwMatrixException(env, e.what());
     } catch (...) {
+        if (created) {
+            MANAGER->removeContext(id);
+        }
         powsybl::jni::throwMatrixException(env, "Unknown exception");
     }
 }
@@ -206,25 +287,55 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JN
  * Method:    update
  * Signature: (Ljava/lang/String;[I[I[DD)D
  */
-JNIEXPORT jdouble JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_update(JNIEnv* env, jobject, jstring j_id, jintArray, jintArray, jdoubleArray j_ax, jdouble) {
+JNIEXPORT jdouble JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_update(JNIEnv* env, jobject, jstring j_id, jintArray j_ap, jintArray j_ai, jdoubleArray j_ax, jdouble rgrowthThreshold) {
     try {
         std::string id = powsybl::jni::StringUTF(env, j_id).toStr();
+        powsybl::jni::IntArray ap(env, j_ap);
+        powsybl::jni::IntArray ai(env, j_ai);
         powsybl::jni::DoubleArray ax(env, j_ax);
 
         CuDssContext& ctx = MANAGER->findContext(id);
         if (static_cast<int>(ax.length()) != ctx.nnz) {
-            throw std::runtime_error("Matrix structure changed since initial decomposition");
+            throw std::runtime_error("Matrix structure changed since initial decomposition "
+                                     "(nonzero count differs)");
         }
+        ctx.checkSameStructure(ap.get(), ap.length(), ai.get(), ai.length());
+
         // structure unchanged: refresh values in place and refactorize
         CUDA_CHECK(cudaMemcpyAsync(ctx.d_ax, ax.get(), ctx.nnz * sizeof(double), cudaMemcpyHostToDevice, ctx.stream));
-        CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_REFACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+
+        // Mirror the KLU contract as closely as cuDSS allows. rgrowthThreshold <= 0
+        // means the caller wants a full factorization with fresh pivoting: that is
+        // CUDSS_PHASE_FACTORIZATION, which reuses the symbolic analysis but re-pivots
+        // (the equivalent of klu_factor after klu_analyze). A positive threshold takes
+        // the cheap CUDSS_PHASE_REFACTORIZATION, which reuses the pivot order.
+        //
+        // cuDSS exposes no reciprocal pivot growth, so KLU's "measure growth, redo the
+        // factorization if it degraded" check cannot be reproduced exactly. What we can
+        // detect is the reused pivot order hitting a zero pivot, and in that case we
+        // fall back to a full factorization instead of returning a bad solve.
+        if (rgrowthThreshold > 0) {
+            CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_REFACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+            if (getInfo(ctx) != 0) {
+                CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_FACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+                checkInfo(ctx, "cuDSS factorization");
+            }
+        } else {
+            CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_FACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+            checkInfo(ctx, "cuDSS factorization");
+        }
     } catch (const std::exception& e) {
         powsybl::jni::throwMatrixException(env, e.what());
     } catch (...) {
         powsybl::jni::throwMatrixException(env, "Unknown exception");
     }
-    return 1.0;  // cuDSS has no rgrowth metric; report a benign value
+    // cuDSS has no reciprocal pivot growth metric. Reporting NaN ("not available")
+    // rather than a plausible-looking 1.0 keeps a caller's `rgrowth < threshold`
+    // health check from silently reading as "healthy" on every single update.
+    return std::numeric_limits<double>::quiet_NaN();
 }
 
 /*

@@ -55,6 +55,12 @@ $> mvn install        # bundles libmathcudss into the jar, like libmath
 into `target/classes/natives/<arch>/` and packaged into the jar (so the GPU backend
 is selectable with no manual staging); when OFF, it is never produced.
 
+**Not covered by CI.** CI has neither the CUDA toolkit nor a GPU, so `libmathcudss`
+is never built there and `CuDssMatrixTest` skips every case (`assumeTrue` on
+`CuDssLUDecomposition.isAvailable()`). A green build therefore says nothing about
+the cuDSS backend — run `mvn test` on a machine with a GPU and a `-DWITH_CUDSS=ON`
+build to actually exercise it.
+
 **On redistribution.** `libmathcudss` is our own small JNI wrapper (MPL) and is
 *dynamically* linked to cuDSS, so a jar that contains it never contains NVIDIA's
 `libcudss.so` — only a runtime reference to it. Our wrapper is therefore freely

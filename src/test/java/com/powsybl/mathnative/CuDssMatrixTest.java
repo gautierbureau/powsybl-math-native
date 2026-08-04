@@ -8,9 +8,12 @@
 package com.powsybl.mathnative;
 
 import com.powsybl.math.matrix.CuDssLUDecomposition;
+import com.powsybl.math.matrix.MatrixException;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -74,5 +77,96 @@ class CuDssMatrixTest {
         lu.release(id);
 
         assertArrayEquals(expected, b, EPSILON);
+    }
+
+    /**
+     * A structurally singular matrix (column 1 is empty) must fail loudly, the way the
+     * KLU backend throws on KLU_SINGULAR, rather than yielding a NaN solution.
+     */
+    @Test
+    void singularMatrixThrows() {
+        assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
+
+        int[] ap = {0, 1, 1, 2};
+        int[] ai = {0, 2};
+        double[] ax = {1.0, 1.0};
+
+        CuDssLUDecomposition lu = new CuDssLUDecomposition();
+        assertThrows(MatrixException.class, () -> lu.init("singular", ap, ai, ax));
+    }
+
+    /**
+     * A failed init must not leave the id registered, otherwise every later attempt
+     * would report "already exists" instead of the real error.
+     */
+    @Test
+    void failedInitDoesNotKeepTheId() {
+        assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
+
+        CuDssLUDecomposition lu = new CuDssLUDecomposition();
+        String id = "retry";
+        // ai shorter than ax: rejected before any GPU work
+        assertThrows(MatrixException.class, () -> lu.init(id, AP, new int[]{0}, AX));
+
+        // the same id must still be usable
+        lu.init(id, AP, AI, AX);
+        lu.release(id);
+    }
+
+    /**
+     * A sparsity pattern change that preserves the nonzero count must be rejected: the
+     * refactorization reuses the pattern captured at init, so accepting it would apply
+     * the new values to the wrong positions.
+     */
+    @Test
+    void updateWithChangedPatternThrows() {
+        assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
+
+        CuDssLUDecomposition lu = new CuDssLUDecomposition();
+        String id = "pattern";
+        lu.init(id, AP, AI, AX);
+
+        int[] changedAi = AI.clone();
+        changedAi[0] = 2; // same nnz, different pattern
+        MatrixException e = assertThrows(MatrixException.class, () -> lu.update(id, AP, changedAi, AX, 0));
+        assertTrue(e.getMessage().contains("structure changed"), e.getMessage());
+
+        lu.release(id);
+    }
+
+    /**
+     * A right-hand side whose size does not match the factorized order must be reported
+     * as such, not as an opaque cuDSS status code.
+     */
+    @Test
+    void solveWithWrongRhsSizeThrows() {
+        assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
+
+        CuDssLUDecomposition lu = new CuDssLUDecomposition();
+        String id = "rhs";
+        lu.init(id, AP, AI, AX);
+
+        double[] tooShort = new double[3];
+        MatrixException e = assertThrows(MatrixException.class, () -> lu.solve(id, tooShort, true));
+        assertTrue(e.getMessage().contains("does not match matrix order"), e.getMessage());
+
+        lu.release(id);
+    }
+
+    /**
+     * The non-transposed sparse solve is not implemented and must say so.
+     */
+    @Test
+    void nonTransposedSolveThrows() {
+        assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
+
+        CuDssLUDecomposition lu = new CuDssLUDecomposition();
+        String id = "notranspose";
+        lu.init(id, AP, AI, AX);
+
+        double[] b = new double[AP.length - 1];
+        assertThrows(MatrixException.class, () -> lu.solve(id, b, false));
+
+        lu.release(id);
     }
 }
