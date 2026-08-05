@@ -79,6 +79,27 @@ public:
         }
     }
 
+    // Remember which Java arrays carried the pattern at init, so update() can
+    // recognise them and skip the O(nnz) comparison below.
+    //
+    // Weak refs on purpose: a global ref would keep the caller's arrays alive for as
+    // long as the decomposition lives. If they are collected the identity test simply
+    // fails and we fall back to the full comparison, which is always correct.
+    void captureArrayIdentity(JNIEnv* env, jintArray ap, jintArray ai) {
+        releaseArrayIdentity(env);
+        apRef = env->NewWeakGlobalRef(ap);
+        aiRef = env->NewWeakGlobalRef(ai);
+    }
+
+    void releaseArrayIdentity(JNIEnv* env) {
+        if (apRef) { env->DeleteWeakGlobalRef(apRef); apRef = nullptr; }
+        if (aiRef) { env->DeleteWeakGlobalRef(aiRef); aiRef = nullptr; }
+    }
+
+    bool isSameArrays(JNIEnv* env, jintArray ap, jintArray ai) const {
+        return apRef && aiRef && env->IsSameObject(ap, apRef) && env->IsSameObject(ai, aiRef);
+    }
+
     // The refactorization path reuses the sparsity pattern captured at init, so an
     // update that silently changed it would apply the new values to the wrong
     // positions. Comparing nonzero counts alone does not catch a pattern change
@@ -124,6 +145,8 @@ public:
     double* d_x = nullptr;
     std::vector<int> hostAp;  // sparsity pattern captured at init, to validate update()
     std::vector<int> hostAi;
+    jweak apRef = nullptr;    // weak refs to the arrays that carried that pattern
+    jweak aiRef = nullptr;
     int n = 0;
     int nnz = 0;
     size_t rhsCapacity = 0;
@@ -271,6 +294,9 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JN
         CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_FACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
         checkInfo(ctx, "cuDSS factorization");
+
+        // Last, so that a failed init leaves no refs behind to clean up.
+        ctx.captureArrayIdentity(env, j_ap, j_ai);
     } catch (const std::exception& e) {
         // Drop the half-built context: it holds a stream, a cuDSS handle and device
         // allocations that nothing else would ever free (Java will not call release
@@ -296,26 +322,40 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JN
 JNIEXPORT jdouble JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_update(JNIEnv* env, jobject, jstring j_id, jintArray j_ap, jintArray j_ai, jdoubleArray j_ax, jdouble rgrowthThreshold) {
     try {
         std::string id = powsybl::jni::StringUTF(env, j_id).toStr();
-        powsybl::jni::IntArray ap(env, j_ap);
-        powsybl::jni::IntArray ai(env, j_ai);
-        powsybl::jni::DoubleArray ax(env, j_ax);
-
         CuDssContext& ctx = MANAGER->findContext(id);
-        if (ap.length() != static_cast<size_t>(ctx.n) + 1) {
+
+        // Cheap invariants, checked on every call. Reading just ap[n] with
+        // GetIntArrayRegion avoids pulling the whole column pointer array across.
+        if (env->GetArrayLength(j_ap) != ctx.n + 1) {
             throw std::runtime_error("Matrix structure changed since initial decomposition "
                                      "(column count differs)");
         }
-        const int* apData = ap.get();
-        // As in init(), the nonzero count is ap[n]; the arrays themselves are Trove
-        // backing arrays and may be longer.
-        if (apData[ctx.n] != ctx.nnz) {
+        jint nnzNow = 0;
+        env->GetIntArrayRegion(j_ap, ctx.n, 1, &nnzNow);
+        if (nnzNow != ctx.nnz) {
             throw std::runtime_error("Matrix structure changed since initial decomposition "
                                      "(nonzero count differs)");
         }
-        if (static_cast<size_t>(ctx.nnz) > ai.length() || static_cast<size_t>(ctx.nnz) > ax.length()) {
-            throw std::runtime_error("Row index / value arrays are shorter than the nonzero count");
+
+        // Fast path: the caller handed back the very same arrays we captured at init.
+        // powsybl's SparseMatrix keeps one columnStart array and one Trove backing
+        // array for the row indices, and SparseLUDecomposition.checkMatrixStructure()
+        // rejects any growth that would reallocate them, so identical objects plus an
+        // unchanged ap[n] means an unchanged pattern. Anything else - different arrays,
+        // or refs already collected - falls back to comparing the pattern in full.
+        if (!ctx.isSameArrays(env, j_ap, j_ai)) {
+            powsybl::jni::IntArray ap(env, j_ap);
+            powsybl::jni::IntArray ai(env, j_ai);
+            if (static_cast<size_t>(ctx.nnz) > ai.length()) {
+                throw std::runtime_error("Row index array is shorter than the nonzero count");
+            }
+            ctx.checkSameStructure(ap.get(), ap.length(), ai.get(), static_cast<size_t>(ctx.nnz));
         }
-        ctx.checkSameStructure(apData, ap.length(), ai.get(), static_cast<size_t>(ctx.nnz));
+
+        powsybl::jni::DoubleArray ax(env, j_ax);
+        if (static_cast<size_t>(ctx.nnz) > ax.length()) {
+            throw std::runtime_error("Value array is shorter than the nonzero count");
+        }
 
         // structure unchanged: refresh values in place and refactorize
         CUDA_CHECK(cudaMemcpyAsync(ctx.d_ax, ax.get(), ctx.nnz * sizeof(double), cudaMemcpyHostToDevice, ctx.stream));
@@ -327,22 +367,18 @@ JNIEXPORT jdouble JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_upda
         // the cheap CUDSS_PHASE_REFACTORIZATION, which reuses the pivot order.
         //
         // cuDSS exposes no reciprocal pivot growth, so KLU's "measure growth, redo the
-        // factorization if it degraded" check cannot be reproduced exactly. What we can
-        // detect is the reused pivot order hitting a zero pivot, and in that case we
-        // fall back to a full factorization instead of returning a bad solve.
-        if (rgrowthThreshold > 0) {
-            CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_REFACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-            if (getInfo(ctx) != 0) {
-                CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_FACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
-                CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-                checkInfo(ctx, "cuDSS factorization");
-            }
-        } else {
-            CUDSS_CHECK(cudssExecute(ctx.handle, CUDSS_PHASE_FACTORIZATION, ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
-            CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
-            checkInfo(ctx, "cuDSS factorization");
-        }
+        // factorization if it degraded" check cannot be reproduced. A refactorization
+        // that hits a zero pivot simply throws: open-loadflow's JacobianMatrix catches
+        // MatrixException from an incremental update and retries with
+        // allowIncrementalUpdate = false, which lands here with a threshold of 0 and so
+        // takes the full factorization path. Retrying internally would only duplicate
+        // that, and would hide the incremental failure from the caller's logs.
+        bool incremental = rgrowthThreshold > 0;
+        CUDSS_CHECK(cudssExecute(ctx.handle,
+                                 incremental ? CUDSS_PHASE_REFACTORIZATION : CUDSS_PHASE_FACTORIZATION,
+                                 ctx.config, ctx.data, ctx.matA, ctx.matX, ctx.matB));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        checkInfo(ctx, incremental ? "cuDSS refactorization" : "cuDSS factorization");
     } catch (const std::exception& e) {
         powsybl::jni::throwMatrixException(env, e.what());
     } catch (...) {
@@ -363,6 +399,9 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_release
     try {
         std::string id = powsybl::jni::StringUTF(env, j_id).toStr();
         CuDssContext& ctx = MANAGER->findContext(id);
+        // The destructor has no JNIEnv, so the weak refs have to go here. This and the
+        // init failure path (which captures none) are the only ways a context dies.
+        ctx.releaseArrayIdentity(env);
         ctx.destroy();
         MANAGER->removeContext(id);
     } catch (const std::exception& e) {

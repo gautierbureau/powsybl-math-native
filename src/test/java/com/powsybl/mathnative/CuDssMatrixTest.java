@@ -166,6 +166,28 @@ class CuDssMatrixTest {
     }
 
     /**
+     * Distinct array objects holding the same pattern miss the identity fast path, so
+     * this exercises the full comparison — which must accept them, not just reject
+     * mismatches.
+     */
+    @Test
+    void updateWithEquivalentCopiesIsAccepted() {
+        assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
+
+        double[] expected = {2, 4, 6, 8, 10};
+        double[] b = transposeTimes(expected);
+
+        CuDssLUDecomposition lu = new CuDssLUDecomposition();
+        String id = "copies";
+        lu.init(id, AP, AI, AX);
+        lu.update(id, AP.clone(), AI.clone(), AX.clone(), 0);
+        lu.solve(id, b, true);
+        lu.release(id);
+
+        assertArrayEquals(expected, b, EPSILON);
+    }
+
+    /**
      * A right-hand side whose size does not match the factorized order must be reported
      * as such, not as an opaque cuDSS status code.
      */
