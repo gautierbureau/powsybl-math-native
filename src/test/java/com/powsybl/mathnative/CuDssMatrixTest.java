@@ -11,6 +11,8 @@ import com.powsybl.math.matrix.CuDssLUDecomposition;
 import com.powsybl.math.matrix.MatrixException;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
+
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -80,6 +82,35 @@ class CuDssMatrixTest {
     }
 
     /**
+     * powsybl's {@code SparseMatrix} hands out the backing arrays of its Trove lists,
+     * so {@code getRowIndices()} and {@code getValues()} are normally longer than the
+     * nonzero count — that is the shape open-loadflow builds its Jacobian in. The
+     * nonzero count must come from {@code ap[n]}, and the trailing capacity must be
+     * ignored rather than fed to cuDSS as extra nonzeros.
+     */
+    @Test
+    void trailingArrayCapacityIsIgnored() {
+        assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
+
+        int[] paddedAi = Arrays.copyOf(AI, AI.length + 7);
+        double[] paddedAx = Arrays.copyOf(AX, AX.length + 7);
+        Arrays.fill(paddedAi, AI.length, paddedAi.length, 3);        // garbage tail
+        Arrays.fill(paddedAx, AX.length, paddedAx.length, 999.0);
+
+        double[] expected = {1, 2, 3, 4, 5};
+        double[] b = transposeTimes(expected);
+
+        CuDssLUDecomposition lu = new CuDssLUDecomposition();
+        String id = "padded";
+        lu.init(id, AP, paddedAi, paddedAx);
+        lu.update(id, AP, paddedAi, paddedAx, 0);
+        lu.solve(id, b, true);
+        lu.release(id);
+
+        assertArrayEquals(expected, b, EPSILON);
+    }
+
+    /**
      * A structurally singular matrix (column 1 is empty) must fail loudly, the way the
      * KLU backend throws on KLU_SINGULAR, rather than yielding a NaN solution.
      */
@@ -105,7 +136,7 @@ class CuDssMatrixTest {
 
         CuDssLUDecomposition lu = new CuDssLUDecomposition();
         String id = "retry";
-        // ai shorter than ax: rejected before any GPU work
+        // row index array shorter than the nonzero count: rejected before any GPU work
         assertThrows(MatrixException.class, () -> lu.init(id, AP, new int[]{0}, AX));
 
         // the same id must still be usable

@@ -83,8 +83,8 @@ public:
     // update that silently changed it would apply the new values to the wrong
     // positions. Comparing nonzero counts alone does not catch a pattern change
     // that preserves nnz (e.g. a topology change), hence the full comparison.
-    void checkSameStructure(const int* newAp, size_t apLength, const int* newAi, size_t aiLength) const {
-        if (apLength != hostAp.size() || aiLength != hostAi.size()) {
+    void checkSameStructure(const int* newAp, size_t apLength, const int* newAi, size_t aiCount) const {
+        if (apLength != hostAp.size() || aiCount != hostAi.size()) {
             throw std::runtime_error("Matrix structure changed since initial decomposition "
                                      "(nonzero count differs)");
         }
@@ -226,18 +226,24 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JN
         if (ap.length() < 1) {
             throw std::runtime_error("Invalid column pointer array: at least one element expected");
         }
-        if (ai.length() != ax.length()) {
-            throw std::runtime_error("Row index array (" + std::to_string(ai.length()) +
-                                     ") and value array (" + std::to_string(ax.length()) +
-                                     ") must have the same length");
+        int n = static_cast<int>(ap.length()) - 1;
+        const int* apData = ap.get();
+        // The nonzero count is ap[n], NOT ax.length(). powsybl's SparseMatrix hands
+        // out the backing arrays of its Trove lists, whose length is the allocated
+        // capacity and is routinely larger than the number of nonzeros.
+        int nnz = apData[n];
+        if (nnz < 0 || static_cast<size_t>(nnz) > ai.length() || static_cast<size_t>(nnz) > ax.length()) {
+            throw std::runtime_error("Declared nonzero count " + std::to_string(nnz) +
+                                     " does not fit in the row index (" + std::to_string(ai.length()) +
+                                     ") and value (" + std::to_string(ax.length()) + ") arrays");
         }
 
         CuDssContext& ctx = MANAGER->createContext(id);
         created = true;
-        ctx.n = static_cast<int>(ap.length()) - 1;
-        ctx.nnz = static_cast<int>(ax.length());
-        ctx.hostAp.assign(ap.get(), ap.get() + ap.length());
-        ctx.hostAi.assign(ai.get(), ai.get() + ai.length());
+        ctx.n = n;
+        ctx.nnz = nnz;
+        ctx.hostAp.assign(apData, apData + n + 1);
+        ctx.hostAi.assign(ai.get(), ai.get() + nnz);
 
         CUDA_CHECK(cudaStreamCreate(&ctx.stream));
         CUDSS_CHECK(cudssCreate(&ctx.handle));
@@ -295,11 +301,21 @@ JNIEXPORT jdouble JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_upda
         powsybl::jni::DoubleArray ax(env, j_ax);
 
         CuDssContext& ctx = MANAGER->findContext(id);
-        if (static_cast<int>(ax.length()) != ctx.nnz) {
+        if (ap.length() != static_cast<size_t>(ctx.n) + 1) {
+            throw std::runtime_error("Matrix structure changed since initial decomposition "
+                                     "(column count differs)");
+        }
+        const int* apData = ap.get();
+        // As in init(), the nonzero count is ap[n]; the arrays themselves are Trove
+        // backing arrays and may be longer.
+        if (apData[ctx.n] != ctx.nnz) {
             throw std::runtime_error("Matrix structure changed since initial decomposition "
                                      "(nonzero count differs)");
         }
-        ctx.checkSameStructure(ap.get(), ap.length(), ai.get(), ai.length());
+        if (static_cast<size_t>(ctx.nnz) > ai.length() || static_cast<size_t>(ctx.nnz) > ax.length()) {
+            throw std::runtime_error("Row index / value arrays are shorter than the nonzero count");
+        }
+        ctx.checkSameStructure(apData, ap.length(), ai.get(), static_cast<size_t>(ctx.nnz));
 
         // structure unchanged: refresh values in place and refactorize
         CUDA_CHECK(cudaMemcpyAsync(ctx.d_ax, ax.get(), ctx.nnz * sizeof(double), cudaMemcpyHostToDevice, ctx.stream));
