@@ -161,6 +161,12 @@ void solveInto(CuDssContext& ctx, double* host, int rows, int cols, bool transpo
         throw std::runtime_error("cuDSS backend supports only the transposed solve "
                                  "(non-transposed sparse solve is not implemented)");
     }
+    if (cols == 0 || rows == 0) {
+        // Nothing to solve. cuDSS SIGFPEs on a dense matrix with zero columns, and OLF's
+        // Woodbury security analysis does issue one: on a connected component that owns no
+        // contingency element, ComputedElement.calculateElementsStates solves an n x 0 RHS.
+        return;
+    }
     ctx.ensureRhs(rows, cols);
     int total = rows * cols;
     CUDA_CHECK(cudaMemcpyAsync(ctx.d_b, host, total * sizeof(double), cudaMemcpyHostToDevice, ctx.stream));
