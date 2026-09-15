@@ -53,6 +53,12 @@ namespace {
 // Number of iterative-refinement steps. cuDSS default pivoting leaves ~1e-3
 // error on unsymmetric systems; 2 steps recover KLU-grade accuracy.
 constexpr int IR_N_STEPS = 2;
+// cuDSS matching algorithm applied before reordering (see the comment at the config site).
+// Override at build time with -DMATH_CUDSS_MATCHING_ALG=<cudssMatchingAlg_t value>.
+#ifndef MATH_CUDSS_MATCHING_ALG
+#  define MATH_CUDSS_MATCHING_ALG CUDSS_MATCHING_ALG_AUTO
+#endif
+constexpr cudssMatchingAlg_t MATCHING_ALG = static_cast<cudssMatchingAlg_t>(MATH_CUDSS_MATCHING_ALG);
 
 class CuDssContext {
 public:
@@ -191,6 +197,15 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_CuDssLUDecomposition_init(JN
         CUDSS_CHECK(cudssConfigCreate(&ctx.config));
         int irSteps = IR_N_STEPS;
         CUDSS_CHECK(cudssConfigSet(ctx.config, CUDSS_CONFIG_IR_N_STEPS, &irSteps, sizeof(irSteps)));
+        // OLF's Jacobian is stored with rows = variables and columns = equations, and the two are
+        // numbered independently, so the matrix as fed here has a structurally EMPTY diagonal on
+        // most columns (e.g. every bus after the slack in a DC system, whose inactive P equation
+        // shifts the equation numbering by one). KLU pivots through that; cuDSS without matching
+        // does not and returns NaN, then SIGFPEs on the next multi-column solve. Matching
+        // permutes the rows onto a non-zero diagonal before the reordering — the same role the
+        // BTF/COLAMD pivoting plays in KLU. MATCHING_ALG_AUTO lets cuDSS pick the weighted scheme.
+        cudssMatchingAlg_t matching = MATCHING_ALG;
+        CUDSS_CHECK(cudssConfigSet(ctx.config, CUDSS_CONFIG_MATCHING_ALG, &matching, sizeof(matching)));
         CUDSS_CHECK(cudssDataCreate(ctx.handle, &ctx.data));
 
         CUDA_CHECK(cudaMalloc(&ctx.d_ap, (ctx.n + 1) * sizeof(int)));
