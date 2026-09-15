@@ -65,35 +65,91 @@ class CuDssMatrixTest {
 
     /**
      * OLF's Jacobian has rows = variables and columns = equations, numbered independently, so most
-     * columns carry NO diagonal entry (a DC system: every bus after the slack). KLU pivots through
-     * that; cuDSS without matching returned NaN. Same 5x5 system with its columns permuted so that
-     * every column lacks its diagonal: column j' = original column PERM[j'].
+     * columns carry NO diagonal entry: in a DC system every bus after the slack, whose inactive P
+     * equation shifts the equation numbering by one. KLU pivots through that; cuDSS without matching
+     * returned NaN on rte6515 (6530 of 6536 columns without a diagonal). This is a synthetic replica:
+     * a 2-D grid of buses with susceptance-like values spread over five decades, the slack bus's
+     * P equation replaced by the reference-angle identity, and the equations numbered so that no
+     * column of the CSC (rows = angle variables, columns = equations) carries a diagonal entry.
      */
     @Test
     void solvesWithEmptyStructuralDiagonal() {
         assumeTrue(CuDssLUDecomposition.isAvailable(), "cuDSS native library not available");
 
-        int[] perm = {2, 1, 4, 3, 0};
-        int n = AP.length - 1;
+        int side = 80;
+        int n = side * side;
+        int slack = n / 2 + side / 2;
+        // equation numbering: equation e is the P balance of bus (e + 2) mod n; the slack bus's
+        // slot carries the reference-angle identity (row = the slack variable). Bus e + 2 is never
+        // bus e nor one of its four grid neighbours, so column e carries no entry in row e.
+        double[][] cols = new double[n][];
+        int[][] rows = new int[n][];
+        java.util.Random random = new java.util.Random(6515);
+        double[] bx = new double[n];   // horizontal susceptances, log-uniform in [0.5, 4e4]
+        double[] by = new double[n];
+        for (int i = 0; i < n; i++) {
+            bx[i] = Math.exp(Math.log(0.5) + random.nextDouble() * Math.log(8e4));
+            by[i] = Math.exp(Math.log(0.5) + random.nextDouble() * Math.log(8e4));
+        }
+        int nnz = 0;
+        for (int e = 0; e < n; e++) {
+            int bus = (e + 2) % n;
+            java.util.TreeMap<Integer, Double> entries = new java.util.TreeMap<>();
+            if (bus == slack) {
+                entries.put(slack, 1.0);
+            } else {
+                int r = bus / side;
+                int c = bus % side;
+                double diag = 0;
+                if (c > 0) {
+                    entries.merge(bus - 1, -bx[bus - 1], Double::sum);
+                    diag += bx[bus - 1];
+                }
+                if (c < side - 1) {
+                    entries.merge(bus + 1, -bx[bus], Double::sum);
+                    diag += bx[bus];
+                }
+                if (r > 0) {
+                    entries.merge(bus - side, -by[bus - side], Double::sum);
+                    diag += by[bus - side];
+                }
+                if (r < side - 1) {
+                    entries.merge(bus + side, -by[bus], Double::sum);
+                    diag += by[bus];
+                }
+                entries.merge(bus, diag, Double::sum);
+            }
+            rows[e] = entries.keySet().stream().mapToInt(Integer::intValue).toArray();
+            cols[e] = entries.values().stream().mapToDouble(Double::doubleValue).toArray();
+            nnz += rows[e].length;
+        }
         int[] ap = new int[n + 1];
-        int[] ai = new int[AI.length];
-        double[] ax = new double[AX.length];
+        int[] ai = new int[nnz];
+        double[] ax = new double[nnz];
         int k = 0;
-        for (int col = 0; col < n; col++) {
-            int src = perm[col];
-            for (int q = AP[src]; q < AP[src + 1]; q++) {
-                assertTrue(AI[q] != col, "the permuted system must have an empty structural diagonal");
-                ai[k] = AI[q];
-                ax[k] = AX[q];
+        int columnsWithDiagonal = 0;
+        for (int e = 0; e < n; e++) {
+            for (int q = 0; q < rows[e].length; q++) {
+                if (rows[e][q] == e) {
+                    columnsWithDiagonal++;
+                }
+                ai[k] = rows[e][q];
+                ax[k] = cols[e][q];
                 k++;
             }
-            ap[col + 1] = k;
+            ap[e + 1] = k;
         }
-        double[] expected = {1, 2, 3, 4, 5};
+        assertTrue(columnsWithDiagonal < n / 100, "the system must have an (almost) empty structural diagonal, got "
+                + columnsWithDiagonal + " columns with one");
+        double[] expected = new double[n];
+        for (int i = 0; i < n; i++) {
+            expected[i] = Math.sin(0.01 * i);
+        }
+        expected[slack] = 0;
         double[] b = new double[n];
-        for (int col = 0; col < n; col++) {
-            for (int q = ap[col]; q < ap[col + 1]; q++) {
-                b[col] += ax[q] * expected[ai[q]];
+        for (int e = 0; e < n; e++) {
+            for (int q = ap[e]; q < ap[e + 1]; q++) {
+                b[e] += ax[q] * expected[ai[q]];        // (M^T x)_e = sum over column e
             }
         }
 
@@ -103,10 +159,12 @@ class CuDssMatrixTest {
         lu.solve(id, b, true);
         lu.release(id);
 
-        for (double v : b) {
-            assertFalse(Double.isNaN(v), "cuDSS returned NaN on an empty structural diagonal (matching off?)");
+        double maxErr = 0;
+        for (int i = 0; i < n; i++) {
+            assertFalse(Double.isNaN(b[i]), "cuDSS returned NaN on an empty structural diagonal (matching off?)");
+            maxErr = Math.max(maxErr, Math.abs(b[i] - expected[i]));
         }
-        assertArrayEquals(expected, b, EPSILON);
+        assertTrue(maxErr < 1e-7, "max error " + maxErr);
     }
 
     /**
