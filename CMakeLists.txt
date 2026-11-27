@@ -54,6 +54,7 @@ set(SOURCES
     src/main/cpp/native.cpp
     src/main/cpp/lu.cpp
     src/main/cpp/solver.cpp
+    src/main/cpp/staticlu.cpp
 )
 add_library(math SHARED ${SOURCES})
 
