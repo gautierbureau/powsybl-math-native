@@ -8,8 +8,8 @@
  * @author Gautier Bureau <gautier.bureau at rte-france.com>
  *
  * A sparse LU with a static elimination order and no pivoting, for a matrix whose pattern does not change while its
- * values do: the order (AMD of the symmetrized pattern), the exact fill and the list of the operations of the
- * factorization are computed once, a factorization only runs the list. A pivot too small, or a multiplier too large,
+ * values do: the order (minimum fill or AMD of the symmetrized pattern, the one with the fewer operations), the exact
+ * fill and the list of the operations of the factorization are computed once, a factorization only runs the list. A pivot too small, or a multiplier too large,
  * is counted: the caller then factorizes with pivoting instead. It is the CPU counterpart of the fast engine of a
  * batched LU on a GPU.
  *
@@ -19,11 +19,12 @@
 
 #include <algorithm>
 #include <cmath>
-#include <functional>
+#include <cstdint>
 #include <memory>
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <amd.h>
 #include "jniwrapper.hpp"
@@ -32,10 +33,122 @@ namespace {
 
 const double PIVOT_EPSILON = 1e-10;
 const double MULTIPLIER_LIMIT = 1e8;
+// the updates of a row by a pivot row are padded to a multiple of this many, so that the loop runs a whole number of
+// unrolled iterations: fewer, and better predicted, loop exits on the short runs of a power network's factors
+const int UNROLL = 4;
+
+/*
+ * A greedy minimum-fill order (Tinney's scheme 3) of the graph of M + M^T: the next node is the one whose elimination
+ * adds the fewest edges, fill plus degree, ties by the smaller degree. It counts the operations of a factorization
+ * better than a minimum degree, at the cost of a slower ordering, done once per pattern.
+ */
+std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai) {
+    std::vector<std::vector<int>> adj(n);
+    for (int j = 0; j < n; j++) {
+        for (int e = ap[j]; e < ap[j + 1]; e++) {
+            int i = ai[e];
+            if (i != j) {
+                adj[i].push_back(j);
+                adj[j].push_back(i);
+            }
+        }
+    }
+    for (auto& a : adj) {
+        std::sort(a.begin(), a.end());
+        a.erase(std::unique(a.begin(), a.end()), a.end());
+    }
+    std::vector<int> mark(n, -1);
+    int stamp = 0;
+    // fill of v: the pairs of its neighbors that are not adjacent
+    auto key = [&](int v) {
+        stamp++;
+        for (int u : adj[v]) {
+            mark[u] = stamp;
+        }
+        long long d = static_cast<long long>(adj[v].size());
+        long long adjacentPairs = 0;
+        for (int u : adj[v]) {
+            for (int w : adj[u]) {
+                if (mark[w] == stamp) {
+                    adjacentPairs++;
+                }
+            }
+        }
+        long long fill = d * (d - 1) / 2 - adjacentPairs / 2;
+        return (fill + d) * (static_cast<long long>(n) + 1) + d;
+    };
+    using Item = std::pair<long long, int>;
+    std::priority_queue<Item, std::vector<Item>, std::greater<Item>> queue;
+    std::vector<long long> current(n);
+    for (int v = 0; v < n; v++) {
+        current[v] = key(v);
+        queue.push({current[v], v});
+    }
+    std::vector<char> eliminated(n, 0);
+    std::vector<int> touched(n, -1);
+    std::vector<int> order;
+    order.reserve(n);
+    while (!queue.empty()) {
+        auto [k, v] = queue.top();
+        queue.pop();
+        if (eliminated[v] || k != current[v]) {
+            continue;
+        }
+        eliminated[v] = 1;
+        order.push_back(v);
+        std::vector<int> nb = std::move(adj[v]);
+        adj[v].clear();
+        // the neighbors become a clique, without v
+        for (int u : nb) {
+            auto& a = adj[u];
+            a.erase(std::lower_bound(a.begin(), a.end(), v));
+            stamp++;
+            for (int w : a) {
+                mark[w] = stamp;
+            }
+            size_t before = a.size();
+            for (int w : nb) {
+                if (w != u && mark[w] != stamp) {
+                    a.push_back(w);
+                }
+            }
+            if (a.size() != before) {
+                std::sort(a.begin(), a.end());
+            }
+        }
+        // the keys change for the neighbors and for their neighbors
+        int round = static_cast<int>(order.size());
+        for (int u : nb) {
+            for (int w : adj[u]) {
+                if (touched[w] != round) {
+                    touched[w] = round;
+                    current[w] = key(w);
+                    queue.push({current[w], w});
+                }
+            }
+            if (touched[u] != round) {
+                touched[u] = round;
+                current[u] = key(u);
+                queue.push({current[u], u});
+            }
+        }
+    }
+    return order;
+}
+
+std::vector<int> amdOrder(int n, const int* ap, const int* ai) {
+    std::vector<int> perm(n);
+    double info[AMD_INFO];
+    if (amd_order(n, ap, ai, perm.data(), nullptr, info) < AMD_OK) {
+        throw std::runtime_error("amd_order error");
+    }
+    return perm;
+}
 
 class StaticLu {
 public:
-    // The plan of M = A^T, whose rows are given by the CSC arrays (ap, ai) of A.
+    // The plan of M = A^T, whose rows are given by the CSC arrays (ap, ai) of A: on the order, minimum fill or AMD,
+    // whose factorization has the fewer operations.
     StaticLu(int n, const int* ap, const int* ai);
 
     // Factorizes M of the values of A, in the order of the CSC arrays of the plan: the number of pivots too small and
@@ -46,43 +159,51 @@ public:
     // rows each, overwritten by the solutions.
     void solve(double* b, int ldim, int nrhs, bool transpose);
 
+    long long operationCount() const { return _opCount; }
+
 private:
+    // the plan on an order (new index -> M's), or only its operation count when countOnly
+    long long plan(const int* ap, const int* ai, const std::vector<int>& perm, bool countOnly);
     void solveM(double* b);
     void solveMT(double* b);
 
     int _n;
     int _nnz;
+    long long _opCount = 0;
     std::vector<int> _perm;          // new index -> M's
     std::vector<int> _rowStart;      // the LU pattern by rows, columns ascending, diagonal included
     std::vector<int> _col;
     std::vector<int> _diag;          // position of the diagonal of each row
     std::vector<int> _entryOfA;      // A's entry -> LU position
+    std::vector<int> _fillPos;       // the LU positions that are not A's entries: zeroed before a factorization
     std::vector<int> _lowerStart;    // per row, its first lower entry in _lowerPos
     std::vector<int> _lowerPos;      // per lower entry, its LU position
-    std::vector<int> _lowerDiag;     // ...the position of its divisor
-    std::vector<int> _opStart;       // ...its first operation (one more entry: the end)
-    std::vector<int> _opSrc;         // per operation: the position of u(k, j)...
-    std::vector<int> _opDst;         // ...and of (i, j)
-    std::vector<double> _lu;
+    std::vector<int> _lowerDiag;     // ...the position of its divisor, the updates reading the values right after it
+    std::vector<int> _opStart;       // ...its first update (one more entry: the end), a multiple of UNROLL
+    std::vector<int> _opDst;         // per update: the position of (i, j), or the dummy slot for the padding
+    std::vector<double> _lu;         // the values, then the dummy slot and room for the padded reads
     std::vector<double> _work;
 };
 
 StaticLu::StaticLu(int n, const int* ap, const int* ai)
     : _n(n),
       _nnz(ap[n]) {
-    _perm.resize(n);
+    std::vector<int> amd = amdOrder(n, ap, ai);
+    std::vector<int> fill = minimumFillOrder(n, ap, ai);
+    bool fillIsBetter = plan(ap, ai, fill, true) <= plan(ap, ai, amd, true);
+    plan(ap, ai, fillIsBetter ? fill : amd, false);
+}
+
+long long StaticLu::plan(const int* ap, const int* ai, const std::vector<int>& perm, bool countOnly) {
+    int n = _n;
     std::vector<int> inv(n);
-    double info[AMD_INFO];
-    if (amd_order(n, ap, ai, _perm.data(), nullptr, info) < AMD_OK) {
-        throw std::runtime_error("amd_order error");
-    }
     for (int k = 0; k < n; k++) {
-        inv[_perm[k]] = k;
+        inv[perm[k]] = k;
     }
     // the rows of B = P M P^T: row r of B is row perm[r] of M, its columns mapped by inv
     std::vector<std::vector<int>> bRows(n);
     for (int r = 0; r < n; r++) {
-        int old = _perm[r];
+        int old = perm[r];
         for (int e = ap[old]; e < ap[old + 1]; e++) {
             bRows[r].push_back(inv[ai[e]]);
         }
@@ -90,7 +211,9 @@ StaticLu::StaticLu(int n, const int* ap, const int* ai)
     }
     // the exact fill, row by row: row i of B united with U(k, > k) for each k < i of its pattern
     std::vector<std::vector<int>> rows(n);
+    std::vector<int> upperCount(n, 0);
     std::vector<int> mark(n, -1);
+    long long ops = 0;
     for (int i = 0; i < n; i++) {
         std::vector<int> pattern;
         std::priority_queue<int, std::vector<int>, std::greater<int>> lower;
@@ -104,6 +227,7 @@ StaticLu::StaticLu(int n, const int* ap, const int* ai)
         while (!lower.empty()) {
             int k = lower.top();
             lower.pop();
+            ops += upperCount[k];
             for (int j : rows[k]) {
                 if (j > k && mark[j] != i) {
                     mark[j] = i;
@@ -115,13 +239,20 @@ StaticLu::StaticLu(int n, const int* ap, const int* ai)
             }
         }
         std::sort(pattern.begin(), pattern.end());
-        rows[i] = pattern;
+        upperCount[i] = static_cast<int>(pattern.end() - std::upper_bound(pattern.begin(), pattern.end(), i));
+        rows[i] = std::move(pattern);
     }
+    if (countOnly) {
+        return ops;
+    }
+    _opCount = ops;
+    _perm = perm;
     _rowStart.assign(n + 1, 0);
     for (int i = 0; i < n; i++) {
         _rowStart[i + 1] = _rowStart[i] + static_cast<int>(rows[i].size());
     }
-    _col.resize(_rowStart[n]);
+    int valueCount = _rowStart[n];
+    _col.resize(valueCount);
     _diag.resize(n);
     for (int i = 0; i < n; i++) {
         std::copy(rows[i].begin(), rows[i].end(), _col.begin() + _rowStart[i]);
@@ -137,12 +268,21 @@ StaticLu::StaticLu(int n, const int* ap, const int* ai)
         return static_cast<int>(std::lower_bound(begin, end, j) - _col.begin());
     };
     _entryOfA.resize(_nnz);
+    std::vector<char> ofA(valueCount, 0);
     for (int old = 0; old < n; old++) {
         for (int e = ap[old]; e < ap[old + 1]; e++) {
             _entryOfA[e] = position(inv[old], inv[ai[e]]);
+            ofA[_entryOfA[e]] = 1;
         }
     }
-    // the operation list, row by row, each lower entry in ascending column with the updates of its pivot row
+    for (int q = 0; q < valueCount; q++) {
+        if (!ofA[q]) {
+            _fillPos.push_back(q);
+        }
+    }
+    // the operation list, row by row, each lower entry in ascending column with the updates of its pivot row: they
+    // read u(k, j) at the positions right after the diagonal of row k, the destinations are padded with a dummy slot
+    int dummy = valueCount;
     _lowerStart.assign(n + 1, 0);
     for (int i = 0; i < n; i++) {
         _lowerStart[i] = static_cast<int>(_lowerPos.size());
@@ -150,25 +290,31 @@ StaticLu::StaticLu(int n, const int* ap, const int* ai)
             int k = _col[q];
             _lowerPos.push_back(q);
             _lowerDiag.push_back(_diag[k]);
-            _opStart.push_back(static_cast<int>(_opSrc.size()));
+            _opStart.push_back(static_cast<int>(_opDst.size()));
             for (int s = _diag[k] + 1; s < _rowStart[k + 1]; s++) {
-                _opSrc.push_back(s);
                 _opDst.push_back(position(i, _col[s]));
+            }
+            while (_opDst.size() % UNROLL != 0) {
+                _opDst.push_back(dummy);
             }
         }
     }
     _lowerStart[n] = static_cast<int>(_lowerPos.size());
-    _opStart.push_back(static_cast<int>(_opSrc.size()));
-    _lu.assign(_col.size(), 0.0);
+    _opStart.push_back(static_cast<int>(_opDst.size()));
+    // the padded reads of the last rows go past the values: the dummy slot and UNROLL more
+    _lu.assign(static_cast<size_t>(valueCount) + 1 + UNROLL, 0.0);
     _work.assign(n, 0.0);
+    return ops;
 }
 
 int StaticLu::factor(const double* ax, int nnz) {
     if (nnz != _nnz) {
         throw std::runtime_error("The values are not those of the pattern of the plan");
     }
-    std::fill(_lu.begin(), _lu.end(), 0.0);
     double* v = _lu.data();
+    for (int q : _fillPos) {
+        v[q] = 0.0;
+    }
     for (int e = 0; e < nnz; e++) {
         v[_entryOfA[e]] = ax[e];
     }
@@ -176,7 +322,6 @@ int StaticLu::factor(const double* ax, int nnz) {
     const int* lowerPos = _lowerPos.data();
     const int* lowerDiag = _lowerDiag.data();
     const int* opStart = _opStart.data();
-    const int* src = _opSrc.data();
     const int* dst = _opDst.data();
     int trouble = 0;
     for (int i = 0; i < _n; i++) {
@@ -186,8 +331,16 @@ int StaticLu::factor(const double* ax, int nnz) {
                 trouble++;
             }
             v[lowerPos[q]] = l;
-            for (int o = opStart[q]; o < opStart[q + 1]; o++) {
-                v[dst[o]] -= l * v[src[o]];
+            const double* u = v + lowerDiag[q] + 1 - opStart[q];
+            for (int o = opStart[q]; o < opStart[q + 1]; o += UNROLL) {
+                double u0 = u[o];
+                double u1 = u[o + 1];
+                double u2 = u[o + 2];
+                double u3 = u[o + 3];
+                v[dst[o]] -= l * u0;
+                v[dst[o + 1]] -= l * u1;
+                v[dst[o + 2]] -= l * u2;
+                v[dst[o + 3]] -= l * u3;
             }
         }
         if (!(std::fabs(v[_diag[i]]) > PIVOT_EPSILON)) {
@@ -200,22 +353,24 @@ int StaticLu::factor(const double* ax, int nnz) {
 // M x = b: B = P M P^T = L U, so x = P^T U^-1 L^-1 P b
 void StaticLu::solveM(double* b) {
     double* w = _work.data();
+    const double* lu = _lu.data();
+    const int* col = _col.data();
     for (int r = 0; r < _n; r++) {
         w[r] = b[_perm[r]];
     }
     for (int i = 0; i < _n; i++) {
         double s = w[i];
         for (int q = _rowStart[i]; q < _diag[i]; q++) {
-            s -= _lu[q] * w[_col[q]];
+            s -= lu[q] * w[col[q]];
         }
         w[i] = s;
     }
     for (int i = _n - 1; i >= 0; i--) {
         double s = w[i];
         for (int q = _diag[i] + 1; q < _rowStart[i + 1]; q++) {
-            s -= _lu[q] * w[_col[q]];
+            s -= lu[q] * w[col[q]];
         }
-        w[i] = s / _lu[_diag[i]];
+        w[i] = s / lu[_diag[i]];
     }
     for (int r = 0; r < _n; r++) {
         b[_perm[r]] = w[r];
@@ -225,20 +380,22 @@ void StaticLu::solveM(double* b) {
 // M^T x = b: B^T = U^T L^T, solved by rows of the factors, scattering
 void StaticLu::solveMT(double* b) {
     double* w = _work.data();
+    const double* lu = _lu.data();
+    const int* col = _col.data();
     for (int r = 0; r < _n; r++) {
         w[r] = b[_perm[r]];
     }
     for (int i = 0; i < _n; i++) {
-        double y = w[i] / _lu[_diag[i]];
+        double y = w[i] / lu[_diag[i]];
         w[i] = y;
         for (int q = _diag[i] + 1; q < _rowStart[i + 1]; q++) {
-            w[_col[q]] -= _lu[q] * y;
+            w[col[q]] -= lu[q] * y;
         }
     }
     for (int i = _n - 1; i >= 0; i--) {
         double z = w[i];
         for (int q = _rowStart[i]; q < _diag[i]; q++) {
-            w[_col[q]] -= _lu[q] * z;
+            w[col[q]] -= lu[q] * z;
         }
     }
     for (int r = 0; r < _n; r++) {
@@ -255,6 +412,38 @@ void StaticLu::solve(double* b, int ldim, int nrhs, bool transpose) {
         }
     }
 }
+
+// A Java array of doubles, pinned rather than copied: nothing else is called while it is held
+class CriticalDoubles {
+public:
+    CriticalDoubles(JNIEnv* env, jdoubleArray array, bool readOnly)
+        : _env(env),
+          _array(array),
+          _length(env->GetArrayLength(array)),
+          _mode(readOnly ? JNI_ABORT : 0) {
+        _ptr = static_cast<double*>(env->GetPrimitiveArrayCritical(array, nullptr));
+        if (!_ptr) {
+            throw std::runtime_error("GetPrimitiveArrayCritical error");
+        }
+    }
+
+    CriticalDoubles(const CriticalDoubles&) = delete;
+    CriticalDoubles& operator=(const CriticalDoubles&) = delete;
+
+    ~CriticalDoubles() {
+        _env->ReleasePrimitiveArrayCritical(_array, _ptr, _mode);
+    }
+
+    double* get() const { return _ptr; }
+    int length() const { return _length; }
+
+private:
+    JNIEnv* _env;
+    jdoubleArray _array;
+    int _length;
+    jint _mode;
+    double* _ptr;
+};
 
 StaticLu* handle(jlong h) {
     if (h == 0) {
@@ -295,8 +484,9 @@ JNIEXPORT jlong JNICALL Java_com_powsybl_math_matrix_StaticLUDecomposition_creat
  */
 JNIEXPORT jint JNICALL Java_com_powsybl_math_matrix_StaticLUDecomposition_factor(JNIEnv* env, jclass, jlong h, jdoubleArray j_ax) {
     try {
-        powsybl::jni::DoubleArray ax(env, j_ax);
-        return handle(h)->factor(ax.get(), static_cast<int>(ax.length()));
+        StaticLu* lu = handle(h);
+        CriticalDoubles ax(env, j_ax, true);
+        return lu->factor(ax.get(), ax.length());
     } catch (const std::exception& e) {
         powsybl::jni::throwMatrixException(env, e.what());
     } catch (...) {
@@ -312,8 +502,9 @@ JNIEXPORT jint JNICALL Java_com_powsybl_math_matrix_StaticLUDecomposition_factor
  */
 JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_StaticLUDecomposition_solve(JNIEnv* env, jclass, jlong h, jdoubleArray j_b, jboolean transpose) {
     try {
-        powsybl::jni::DoubleArray b(env, j_b);
-        handle(h)->solve(b.get(), static_cast<int>(b.length()), 1, transpose);
+        StaticLu* lu = handle(h);
+        CriticalDoubles b(env, j_b, false);
+        lu->solve(b.get(), b.length(), 1, transpose);
     } catch (const std::exception& e) {
         powsybl::jni::throwMatrixException(env, e.what());
     } catch (...) {
