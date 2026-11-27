@@ -8,7 +8,10 @@
  * @author Geoffroy Jamgotchian <geoffroy.jamgotchian at rte-france.com>
  */
 
+#include <algorithm>
+#include <cstdint>
 #include <string>
+#include <vector>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -17,6 +20,7 @@
 #include <cs.h>
 #include "jniwrapper.hpp"
 #include "lu.hpp"
+#include "ordering.hpp"
 
 namespace powsybl {
 
@@ -39,6 +43,55 @@ ComPowsyblMathMatrixSparseMatrix::ComPowsyblMathMatrixSparseMatrix(JNIEnv* env, 
 
 }  // namespace powsybl
 
+namespace {
+
+/**
+ * The parameters of the KLU decompositions created from now on. They are set for the whole process, before the
+ * decompositions they are meant for: each one copies them when it is created.
+ */
+struct KluParameters {
+    // the fill-reducing order of each block: 0 AMD, 1 COLAMD, 2 minimum fill (Tinney's scheme 3)
+    int ordering = 0;
+    // the permutation to a block triangular form
+    bool btf = true;
+    // the scaling of the rows: -1 none and no check of the values, 0 none, 1 by the sum, 2 by the maximum
+    int scale = 2;
+    // the partial pivoting tolerance of a whole factorization
+    double tol = 0.001;
+    // the check of a refactorization on the pivots of the previous factorization: 0 the reciprocal pivot growth
+    // (rgrowth, compared with the threshold given at the update), 1 the estimate of the reciprocal condition number
+    // of the diagonal of U (rcond, compared with rcondThreshold), 2 none
+    int check = 0;
+    double rcondThreshold = 1e-12;
+};
+
+const int ORDERING_MINIMUM_FILL = 2;
+const int CHECK_RGROWTH = 0;
+const int CHECK_RCOND = 1;
+const int CHECK_NONE = 2;
+
+KluParameters DEFAULT_PARAMETERS;
+std::mutex DEFAULT_PARAMETERS_MUTEX;
+
+KluParameters defaultParameters() {
+    std::lock_guard<std::mutex> lk(DEFAULT_PARAMETERS_MUTEX);
+    return DEFAULT_PARAMETERS;
+}
+
+// KLU's user ordering: the minimum fill of the block, its result the number of entries of L it leads to
+int32_t minimumFillUserOrder(int32_t n, int32_t* ap, int32_t* ai, int32_t* perm, klu_common*) {
+    try {
+        long long lowerCount = 0;
+        std::vector<int> order = powsybl::math::minimumFillOrder(n, ap, ai, lowerCount);
+        std::copy(order.begin(), order.end(), perm);
+        return static_cast<int32_t>(std::min<long long>(std::max<long long>(lowerCount, 1), INT32_MAX));
+    } catch (...) {
+        return 0;
+    }
+}
+
+}  // namespace
+
 class LUContext {
 public:
     LUContext() = default;
@@ -55,6 +108,7 @@ public:
     klu_symbolic* symbolic;
     klu_numeric* numeric;
     klu_common common;
+    KluParameters parameters;
 };
 
 std::string LUContext::error() const {
@@ -136,6 +190,16 @@ JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_SparseLUDecomposition_init(J
         if (klu_defaults(&context.common) == 0) {
             throw std::runtime_error("klu_defaults error " + context.error());
         }
+        context.parameters = defaultParameters();
+        context.common.btf = context.parameters.btf ? 1 : 0;
+        context.common.scale = context.parameters.scale;
+        context.common.tol = context.parameters.tol;
+        if (context.parameters.ordering == ORDERING_MINIMUM_FILL) {
+            context.common.ordering = 3;
+            context.common.user_order = minimumFillUserOrder;
+        } else {
+            context.common.ordering = context.parameters.ordering;
+        }
 
         context.symbolic = klu_analyze(ap.length()-1, ap.get(), ai.get(), &context.common);
         if (!context.symbolic) {
@@ -166,18 +230,38 @@ JNIEXPORT jdouble JNICALL Java_com_powsybl_math_matrix_SparseLUDecomposition_upd
         powsybl::jni::DoubleArray ax(env, j_ax);
 
         LUContext& context = MANAGER->findContext(id);
+        // the measure of the refactorization the check is on: rgrowth, rcond, or nothing (always good)
+        bool good = false;
+        double measure = 0;
         if (rgrowthThreshold > 0) {
             int ok = klu_refactor(ap.get(), ai.get(), ax.get(), context.symbolic, context.numeric, &context.common);
             if (ok == 0) {
                 throw std::runtime_error("klu_refactor error " + context.error());
             }
-            ok = klu_rgrowth(ap.get(), ai.get(), ax.get(), context.symbolic, context.numeric, &context.common);
-            if (ok == 0) {
-                throw std::runtime_error("klu_rgrowth error " + context.error());
+            switch (context.parameters.check) {
+                case CHECK_RCOND:
+                    if (klu_rcond(context.symbolic, context.numeric, &context.common) == 0) {
+                        throw std::runtime_error("klu_rcond error " + context.error());
+                    }
+                    measure = context.common.rcond;
+                    good = measure >= context.parameters.rcondThreshold;
+                    break;
+                case CHECK_NONE:
+                    measure = 1;
+                    good = true;
+                    break;
+                default:
+                    ok = klu_rgrowth(ap.get(), ai.get(), ax.get(), context.symbolic, context.numeric, &context.common);
+                    if (ok == 0) {
+                        throw std::runtime_error("klu_rgrowth error " + context.error());
+                    }
+                    measure = context.common.rgrowth;
+                    good = measure >= rgrowthThreshold;
+                    break;
             }
         }
-        // if rgrowth is too small we have to do a whole factorization
-        if (rgrowthThreshold <= 0 || context.common.rgrowth < rgrowthThreshold) {
+        // if the refactorization is not good enough we have to do a whole factorization
+        if (!good) {
             if (klu_free_numeric(&context.numeric, &context.common) == 0) {
                 throw std::runtime_error("klu_free_numeric error " + context.error());
             }
@@ -186,7 +270,7 @@ JNIEXPORT jdouble JNICALL Java_com_powsybl_math_matrix_SparseLUDecomposition_upd
                 throw std::runtime_error("klu_factor error " + context.error());
             }
         }
-        return context.common.rgrowth;
+        return good ? measure : context.common.rgrowth;
     } catch (const std::exception& e) {
         powsybl::jni::throwMatrixException(env, e.what());
     } catch (...) {
@@ -426,6 +510,39 @@ JNIEXPORT jobject JNICALL Java_com_powsybl_math_matrix_SparseMatrix_add(JNIEnv *
         powsybl::jni::throwMatrixException(env, "Unknown exception");
     }
     return nullptr;
+}
+
+/*
+ * Class:     com_powsybl_math_matrix_KluParameters
+ * Method:    setDefaults
+ * Signature: (IZIDID)V
+ */
+JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_KluParameters_setDefaults(JNIEnv * env, jclass, jint ordering, jboolean btf, jint scale,
+                                                                              jdouble tol, jint check, jdouble rcondThreshold) {
+    try {
+        if (ordering < 0 || ordering > ORDERING_MINIMUM_FILL) {
+            throw std::runtime_error("Invalid KLU ordering " + std::to_string(ordering));
+        }
+        if (scale < -1 || scale > 2) {
+            throw std::runtime_error("Invalid KLU scaling " + std::to_string(scale));
+        }
+        if (check < CHECK_RGROWTH || check > CHECK_NONE) {
+            throw std::runtime_error("Invalid KLU refactorization check " + std::to_string(check));
+        }
+        KluParameters parameters;
+        parameters.ordering = ordering;
+        parameters.btf = btf == JNI_TRUE;
+        parameters.scale = scale;
+        parameters.tol = tol;
+        parameters.check = check;
+        parameters.rcondThreshold = rcondThreshold;
+        std::lock_guard<std::mutex> lk(DEFAULT_PARAMETERS_MUTEX);
+        DEFAULT_PARAMETERS = parameters;
+    } catch (const std::exception& e) {
+        powsybl::jni::throwMatrixException(env, e.what());
+    } catch (...) {
+        powsybl::jni::throwMatrixException(env, "Unknown exception");
+    }
 }
 
 #ifdef __cplusplus
