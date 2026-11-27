@@ -40,7 +40,9 @@ const int UNROLL = 4;
 /*
  * A greedy minimum-fill order (Tinney's scheme 3) of the graph of M + M^T: the next node is the one whose elimination
  * adds the fewest edges, fill plus degree, ties by the smaller degree. It counts the operations of a factorization
- * better than a minimum degree, at the cost of a slower ordering, done once per pattern.
+ * better than a minimum degree, at the cost of a slower ordering, done once per pattern. The fills are kept up to
+ * date: an elimination recomputes those of the neighbours only, and each edge it adds is one pair less to fill for
+ * the other common neighbours of its ends.
  */
 std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai) {
     std::vector<std::vector<int>> adj(n);
@@ -59,8 +61,8 @@ std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai) {
     }
     std::vector<int> mark(n, -1);
     int stamp = 0;
-    // fill of v: the pairs of its neighbors that are not adjacent
-    auto key = [&](int v) {
+    std::vector<long long> fill(n);
+    auto computeFill = [&](int v) {
         stamp++;
         for (int u : adj[v]) {
             mark[u] = stamp;
@@ -74,31 +76,43 @@ std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai) {
                 }
             }
         }
-        long long fill = d * (d - 1) / 2 - adjacentPairs / 2;
-        return (fill + d) * (static_cast<long long>(n) + 1) + d;
+        return d * (d - 1) / 2 - adjacentPairs / 2;
+    };
+    auto key = [&](int v) {
+        long long d = static_cast<long long>(adj[v].size());
+        return (fill[v] + d) * (static_cast<long long>(n) + 1) + d;
     };
     using Item = std::pair<long long, int>;
     std::priority_queue<Item, std::vector<Item>, std::greater<Item>> queue;
     std::vector<long long> current(n);
     for (int v = 0; v < n; v++) {
+        fill[v] = computeFill(v);
         current[v] = key(v);
         queue.push({current[v], v});
     }
     std::vector<char> eliminated(n, 0);
-    std::vector<int> touched(n, -1);
+    std::vector<int> changed(n, -1);
+    std::vector<int> changedList;
+    std::vector<int> mark2(n, -1);
+    int stamp2 = 0;
     std::vector<int> order;
     order.reserve(n);
+    std::vector<std::pair<int, int>> newEdges;
     while (!queue.empty()) {
-        auto [k, v] = queue.top();
+        long long k = queue.top().first;
+        int v = queue.top().second;
         queue.pop();
         if (eliminated[v] || k != current[v]) {
             continue;
         }
         eliminated[v] = 1;
         order.push_back(v);
+        int round = static_cast<int>(order.size());
         std::vector<int> nb = std::move(adj[v]);
         adj[v].clear();
-        // the neighbors become a clique, without v
+        changedList.clear();
+        newEdges.clear();
+        // the neighbours become a clique, without v
         for (int u : nb) {
             auto& a = adj[u];
             a.erase(std::lower_bound(a.begin(), a.end(), v));
@@ -110,27 +124,44 @@ std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai) {
             for (int w : nb) {
                 if (w != u && mark[w] != stamp) {
                     a.push_back(w);
+                    if (u < w) {
+                        newEdges.push_back({u, w});
+                    }
                 }
             }
             if (a.size() != before) {
                 std::sort(a.begin(), a.end());
             }
         }
-        // the keys change for the neighbors and for their neighbors
-        int round = static_cast<int>(order.size());
-        for (int u : nb) {
-            for (int w : adj[u]) {
-                if (touched[w] != round) {
-                    touched[w] = round;
-                    current[w] = key(w);
-                    queue.push({current[w], w});
+        // a new edge (a, b) is one pair less to fill for each other common neighbour of a and b
+        for (const auto& edge : newEdges) {
+            int a = edge.first;
+            int b = edge.second;
+            stamp2++;
+            for (int c : adj[a]) {
+                mark2[c] = stamp2;
+            }
+            for (int c : adj[b]) {
+                if (mark2[c] == stamp2) {
+                    fill[c]--;
+                    if (changed[c] != round) {
+                        changed[c] = round;
+                        changedList.push_back(c);
+                    }
                 }
             }
-            if (touched[u] != round) {
-                touched[u] = round;
-                current[u] = key(u);
-                queue.push({current[u], u});
+        }
+        // the neighbours: their own fill recomputed (their adjacency changed)
+        for (int u : nb) {
+            fill[u] = computeFill(u);
+            if (changed[u] != round) {
+                changed[u] = round;
+                changedList.push_back(u);
             }
+        }
+        for (int c : changedList) {
+            current[c] = key(c);
+            queue.push({current[c], c});
         }
     }
     return order;
@@ -164,6 +195,11 @@ public:
 private:
     // the plan on an order (new index -> M's), or only its operation count when countOnly
     long long plan(const int* ap, const int* ai, const std::vector<int>& perm, bool countOnly);
+    // the elimination on the values in place: the number of pivots too small and of multipliers too large
+    int eliminate();
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    int eliminateAvx512();
+#endif
     void solveM(double* b);
     void solveMT(double* b);
 
@@ -307,6 +343,19 @@ long long StaticLu::plan(const int* ap, const int* ai, const std::vector<int>& p
     return ops;
 }
 
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+#define STATICLU_AVX512 1
+#include <immintrin.h>
+
+bool hasAvx512() {
+    static const bool has = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    return has;
+}
+#endif
+
+// runs at least this long are vectorized when the CPU has AVX-512 (a multiple of UNROLL)
+const int LONG_RUN = 16;
+
 int StaticLu::factor(const double* ax, int nnz) {
     if (nnz != _nnz) {
         throw std::runtime_error("The values are not those of the pattern of the plan");
@@ -318,6 +367,16 @@ int StaticLu::factor(const double* ax, int nnz) {
     for (int e = 0; e < nnz; e++) {
         v[_entryOfA[e]] = ax[e];
     }
+#ifdef STATICLU_AVX512
+    if (hasAvx512()) {
+        return eliminateAvx512();
+    }
+#endif
+    return eliminate();
+}
+
+int StaticLu::eliminate() {
+    double* v = _lu.data();
     const int* lowerStart = _lowerStart.data();
     const int* lowerPos = _lowerPos.data();
     const int* lowerDiag = _lowerDiag.data();
@@ -349,6 +408,69 @@ int StaticLu::factor(const double* ax, int nnz) {
     }
     return trouble;
 }
+
+#ifdef STATICLU_AVX512
+// The same elimination compiled for AVX-512: the long runs 8 updates at a time with a gather and a scatter, the
+// others as above (with fused multiply-adds: the factors differ from the scalar ones by roundings only).
+__attribute__((target("avx512f,avx2,fma")))
+int StaticLu::eliminateAvx512() {
+    double* v = _lu.data();
+    const int* lowerStart = _lowerStart.data();
+    const int* lowerPos = _lowerPos.data();
+    const int* lowerDiag = _lowerDiag.data();
+    const int* opStart = _opStart.data();
+    const int* dst = _opDst.data();
+    int trouble = 0;
+    for (int i = 0; i < _n; i++) {
+        for (int q = lowerStart[i]; q < lowerStart[i + 1]; q++) {
+            double l = v[lowerPos[q]] / v[lowerDiag[q]];
+            if (!(std::fabs(l) < MULTIPLIER_LIMIT)) {
+                trouble++;
+            }
+            v[lowerPos[q]] = l;
+            const double* u = v + lowerDiag[q] + 1 - opStart[q];
+            int o = opStart[q];
+            int end = opStart[q + 1];
+            if (end - o >= LONG_RUN) {
+                __m512d l8 = _mm512_set1_pd(l);
+                for (; o + 8 <= end; o += 8) {
+                    __m256i idx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + o));
+                    __m512d x = _mm512_i32gather_pd(idx, v, 8);
+                    x = _mm512_fnmadd_pd(l8, _mm512_loadu_pd(u + o), x);
+                    _mm512_i32scatter_pd(v, idx, x, 8);
+                }
+                if (o < end) {
+                    // the last 4: a gather, the stores one by one
+                    __m128i idx = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + o));
+                    __m256d x = _mm256_i32gather_pd(v, idx, 8);
+                    x = _mm256_fnmadd_pd(_mm256_set1_pd(l), _mm256_loadu_pd(u + o), x);
+                    alignas(32) double t[4];
+                    _mm256_store_pd(t, x);
+                    v[dst[o]] = t[0];
+                    v[dst[o + 1]] = t[1];
+                    v[dst[o + 2]] = t[2];
+                    v[dst[o + 3]] = t[3];
+                    continue;
+                }
+            }
+            for (; o < end; o += UNROLL) {
+                double u0 = u[o];
+                double u1 = u[o + 1];
+                double u2 = u[o + 2];
+                double u3 = u[o + 3];
+                v[dst[o]] -= l * u0;
+                v[dst[o + 1]] -= l * u1;
+                v[dst[o + 2]] -= l * u2;
+                v[dst[o + 3]] -= l * u3;
+            }
+        }
+        if (!(std::fabs(v[_diag[i]]) > PIVOT_EPSILON)) {
+            trouble++;
+        }
+    }
+    return trouble;
+}
+#endif
 
 // M x = b: B = P M P^T = L U, so x = P^T U^-1 L^-1 P b
 void StaticLu::solveM(double* b) {
