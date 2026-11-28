@@ -12,6 +12,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <queue>
 #include <utility>
@@ -22,7 +23,10 @@ namespace powsybl {
 
 namespace math {
 
-std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai, long long& lowerCount) {
+namespace {
+
+// the adjacency of the graph of A + A^T, without the diagonal, sorted
+std::vector<std::vector<int>> symmetricAdjacency(int n, const int* ap, const int* ai) {
     std::vector<std::vector<int>> adj(n);
     for (int j = 0; j < n; j++) {
         for (int e = ap[j]; e < ap[j + 1]; e++) {
@@ -37,6 +41,64 @@ std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai, long long
         std::sort(a.begin(), a.end());
         a.erase(std::unique(a.begin(), a.end()), a.end());
     }
+    return adj;
+}
+
+// makes the neighbours of v a clique without v, and returns them; mark is a work array of n stamps
+std::vector<int> eliminate(std::vector<std::vector<int>>& adj, int v, std::vector<int>& mark, int& stamp,
+                           std::vector<std::pair<int, int>>* newEdges) {
+    std::vector<int> nb = std::move(adj[v]);
+    adj[v].clear();
+    for (int u : nb) {
+        auto& a = adj[u];
+        a.erase(std::lower_bound(a.begin(), a.end(), v));
+        stamp++;
+        for (int w : a) {
+            mark[w] = stamp;
+        }
+        size_t before = a.size();
+        for (int w : nb) {
+            if (w != u && mark[w] != stamp) {
+                a.push_back(w);
+                if (newEdges && u < w) {
+                    newEdges->push_back({u, w});
+                }
+            }
+        }
+        if (a.size() != before) {
+            std::sort(a.begin(), a.end());
+        }
+    }
+    return nb;
+}
+
+}  // namespace
+
+bool hasDenseRows(int n, const int* ap, const int* ai) {
+    std::vector<std::vector<int>> adj = symmetricAdjacency(n, ap, ai);
+    double dense = std::max(16.0, 10.0 * std::sqrt(static_cast<double>(n)));
+    for (const auto& a : adj) {
+        if (static_cast<double>(a.size()) > dense) {
+            return true;
+        }
+    }
+    return false;
+}
+
+long long multiplySubtractCount(int n, const int* ap, const int* ai, const std::vector<int>& perm) {
+    std::vector<std::vector<int>> adj = symmetricAdjacency(n, ap, ai);
+    std::vector<int> mark(n, -1);
+    int stamp = 0;
+    long long count = 0;
+    for (int v : perm) {
+        long long d = static_cast<long long>(eliminate(adj, v, mark, stamp, nullptr).size());
+        count += d * d;
+    }
+    return count;
+}
+
+std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai, long long& lowerCount, long long& multiplySubtracts) {
+    std::vector<std::vector<int>> adj = symmetricAdjacency(n, ap, ai);
     std::vector<int> mark(n, -1);
     int stamp = 0;
     std::vector<long long> fill(n);
@@ -77,6 +139,7 @@ std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai, long long
     order.reserve(n);
     std::vector<std::pair<int, int>> newEdges;
     lowerCount = n;
+    multiplySubtracts = 0;
     while (!queue.empty()) {
         long long k = queue.top().first;
         int v = queue.top().second;
@@ -87,32 +150,12 @@ std::vector<int> minimumFillOrder(int n, const int* ap, const int* ai, long long
         eliminated[v] = 1;
         order.push_back(v);
         int round = static_cast<int>(order.size());
-        std::vector<int> nb = std::move(adj[v]);
-        adj[v].clear();
-        lowerCount += static_cast<long long>(nb.size());
         changedList.clear();
         newEdges.clear();
         // the neighbours become a clique, without v
-        for (int u : nb) {
-            auto& a = adj[u];
-            a.erase(std::lower_bound(a.begin(), a.end(), v));
-            stamp++;
-            for (int w : a) {
-                mark[w] = stamp;
-            }
-            size_t before = a.size();
-            for (int w : nb) {
-                if (w != u && mark[w] != stamp) {
-                    a.push_back(w);
-                    if (u < w) {
-                        newEdges.push_back({u, w});
-                    }
-                }
-            }
-            if (a.size() != before) {
-                std::sort(a.begin(), a.end());
-            }
-        }
+        std::vector<int> nb = eliminate(adj, v, mark, stamp, &newEdges);
+        lowerCount += static_cast<long long>(nb.size());
+        multiplySubtracts += static_cast<long long>(nb.size()) * static_cast<long long>(nb.size());
         // a new edge (a, b) is one pair less to fill for each other common neighbour of a and b
         for (const auto& edge : newEdges) {
             int a = edge.first;

@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <amd.h>
 #include <klu.h>
 #include <cs.h>
 #include "jniwrapper.hpp"
@@ -50,7 +51,9 @@ namespace {
  * decompositions they are meant for: each one copies them when it is created.
  */
 struct KluParameters {
-    // the fill-reducing order of each block: 0 AMD, 1 COLAMD, 2 minimum fill (Tinney's scheme 3)
+    // the fill-reducing order of each block: 0 AMD, 1 COLAMD, 2 minimum fill (Tinney's scheme 3) or AMD, the one
+    // whose factorization has the fewer operations (AMD without trying the minimum fill when a row is dense). The
+    // minimum fill takes some 30 times longer to compute than AMD: it pays off for a pattern factorized many times
     int ordering = 0;
     // the permutation to a block triangular form
     bool btf = true;
@@ -59,9 +62,10 @@ struct KluParameters {
     // the partial pivoting tolerance of a whole factorization
     double tol = 0.001;
     // the check of a refactorization on the pivots of the previous factorization: 0 the reciprocal pivot growth
-    // (rgrowth, compared with the threshold given at the update), 1 the estimate of the reciprocal condition number
-    // of the diagonal of U (rcond, compared with rcondThreshold), 2 none
-    int check = 0;
+    // (rgrowth, compared with the threshold given at the update, a pass on all the values), 1 the estimate of the
+    // reciprocal condition number of the diagonal of U (rcond, compared with rcondThreshold, a pass on the diagonal),
+    // 2 none
+    int check = 1;
     double rcondThreshold = 1e-12;
 };
 
@@ -78,12 +82,25 @@ KluParameters defaultParameters() {
     return DEFAULT_PARAMETERS;
 }
 
-// KLU's user ordering: the minimum fill of the block, its result the number of entries of L it leads to
+// KLU's user ordering of a block: the minimum fill or AMD, the one with the fewer operations; its result the
+// number of entries of L it leads to
 int32_t minimumFillUserOrder(int32_t n, int32_t* ap, int32_t* ai, int32_t* perm, klu_common*) {
     try {
-        long long lowerCount = 0;
-        std::vector<int> order = powsybl::math::minimumFillOrder(n, ap, ai, lowerCount);
-        std::copy(order.begin(), order.end(), perm);
+        double info[AMD_INFO];
+        if (amd_order(n, ap, ai, perm, nullptr, info) < AMD_OK) {
+            return 0;
+        }
+        long long lowerCount = static_cast<long long>(info[AMD_LNZ]) + n;
+        if (n > 1 && !powsybl::math::hasDenseRows(n, ap, ai)) {
+            long long fillLowerCount = 0;
+            long long fillOperations = 0;
+            std::vector<int> fill = powsybl::math::minimumFillOrder(n, ap, ai, fillLowerCount, fillOperations);
+            std::vector<int> amd(perm, perm + n);
+            if (fillOperations < powsybl::math::multiplySubtractCount(n, ap, ai, amd)) {
+                std::copy(fill.begin(), fill.end(), perm);
+                lowerCount = fillLowerCount;
+            }
+        }
         return static_cast<int32_t>(std::min<long long>(std::max<long long>(lowerCount, 1), INT32_MAX));
     } catch (...) {
         return 0;
