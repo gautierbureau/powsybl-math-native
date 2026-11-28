@@ -53,6 +53,7 @@ set(SOURCES
     src/main/cpp/jniwrapper.cpp
     src/main/cpp/native.cpp
     src/main/cpp/lu.cpp
+    src/main/cpp/ordering.cpp
     src/main/cpp/solver.cpp
 )
 add_library(math SHARED ${SOURCES})
