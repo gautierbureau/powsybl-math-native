@@ -186,6 +186,64 @@ void LUContextManager::removeContext(const std::string& id) {
 
 std::unique_ptr<LUContextManager> MANAGER(new LUContextManager());
 
+namespace {
+
+// the decomposition of a new context, on the given parameters
+void initContext(JNIEnv* env, jstring j_id, jintArray j_ap, jintArray j_ai, jdoubleArray j_ax, const KluParameters& parameters) {
+    std::string id = powsybl::jni::StringUTF(env, j_id).toStr();
+    powsybl::jni::IntArray ap(env, j_ap);
+    powsybl::jni::IntArray ai(env, j_ai);
+    powsybl::jni::DoubleArray ax(env, j_ax);
+
+    LUContext& context = MANAGER->createContext(id);
+
+    if (klu_defaults(&context.common) == 0) {
+        throw std::runtime_error("klu_defaults error " + context.error());
+    }
+    context.parameters = parameters;
+    context.common.btf = context.parameters.btf ? 1 : 0;
+    context.common.scale = context.parameters.scale;
+    context.common.tol = context.parameters.tol;
+    if (context.parameters.ordering == ORDERING_MINIMUM_FILL) {
+        context.common.ordering = 3;
+        context.common.user_order = minimumFillUserOrder;
+    } else {
+        context.common.ordering = context.parameters.ordering;
+    }
+
+    context.symbolic = klu_analyze(ap.length()-1, ap.get(), ai.get(), &context.common);
+    if (!context.symbolic) {
+        throw std::runtime_error("klu_analyze error " + context.error());
+    }
+    context.numeric = klu_factor(ap.get(), ai.get(), ax.get(), context.symbolic, &context.common);
+    if (!context.numeric) {
+        throw std::runtime_error("klu_factor error " + context.error());
+    }
+}
+
+// the parameters given through JNI, checked
+KluParameters checkedParameters(jint ordering, jboolean btf, jint scale, jdouble tol, jint check, jdouble rcondThreshold) {
+    if (ordering < 0 || ordering > ORDERING_MINIMUM_FILL) {
+        throw std::runtime_error("Invalid KLU ordering " + std::to_string(ordering));
+    }
+    if (scale < -1 || scale > 2) {
+        throw std::runtime_error("Invalid KLU scaling " + std::to_string(scale));
+    }
+    if (check < CHECK_RGROWTH || check > CHECK_NONE) {
+        throw std::runtime_error("Invalid KLU refactorization check " + std::to_string(check));
+    }
+    KluParameters parameters;
+    parameters.ordering = ordering;
+    parameters.btf = btf == JNI_TRUE;
+    parameters.scale = scale;
+    parameters.tol = tol;
+    parameters.check = check;
+    parameters.rcondThreshold = rcondThreshold;
+    return parameters;
+}
+
+}  // namespace
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -197,35 +255,24 @@ extern "C" {
  */
 JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_SparseLUDecomposition_init(JNIEnv * env, jobject, jstring j_id, jintArray j_ap, jintArray j_ai, jdoubleArray j_ax) {
     try {
-        std::string id = powsybl::jni::StringUTF(env, j_id).toStr();
-        powsybl::jni::IntArray ap(env, j_ap);
-        powsybl::jni::IntArray ai(env, j_ai);
-        powsybl::jni::DoubleArray ax(env, j_ax);
+        initContext(env, j_id, j_ap, j_ai, j_ax, defaultParameters());
+    } catch (const std::exception& e) {
+        powsybl::jni::throwMatrixException(env, e.what());
+    } catch (...) {
+        powsybl::jni::throwMatrixException(env, "Unknown exception");
+    }
+}
 
-        LUContext& context = MANAGER->createContext(id);
- 
-        if (klu_defaults(&context.common) == 0) {
-            throw std::runtime_error("klu_defaults error " + context.error());
-        }
-        context.parameters = defaultParameters();
-        context.common.btf = context.parameters.btf ? 1 : 0;
-        context.common.scale = context.parameters.scale;
-        context.common.tol = context.parameters.tol;
-        if (context.parameters.ordering == ORDERING_MINIMUM_FILL) {
-            context.common.ordering = 3;
-            context.common.user_order = minimumFillUserOrder;
-        } else {
-            context.common.ordering = context.parameters.ordering;
-        }
-
-        context.symbolic = klu_analyze(ap.length()-1, ap.get(), ai.get(), &context.common);
-        if (!context.symbolic) {
-            throw std::runtime_error("klu_analyze error " + context.error());
-        }
-        context.numeric = klu_factor(ap.get(), ai.get(), ax.get(), context.symbolic, &context.common);
-        if (!context.numeric) {
-            throw std::runtime_error("klu_factor error " + context.error());
-        }
+/*
+ * Class:     com_powsybl_math_matrix_SparseLUDecomposition
+ * Method:    initWithParameters
+ * Signature: (Ljava/lang/String;[I[I[DIZIDID)V
+ */
+JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_SparseLUDecomposition_initWithParameters(JNIEnv * env, jobject, jstring j_id, jintArray j_ap, jintArray j_ai,
+                                                                                            jdoubleArray j_ax, jint ordering, jboolean btf, jint scale,
+                                                                                            jdouble tol, jint check, jdouble rcondThreshold) {
+    try {
+        initContext(env, j_id, j_ap, j_ai, j_ax, checkedParameters(ordering, btf, scale, tol, check, rcondThreshold));
     } catch (const std::exception& e) {
         powsybl::jni::throwMatrixException(env, e.what());
     } catch (...) {
@@ -537,22 +584,7 @@ JNIEXPORT jobject JNICALL Java_com_powsybl_math_matrix_SparseMatrix_add(JNIEnv *
 JNIEXPORT void JNICALL Java_com_powsybl_math_matrix_KluParameters_setDefaults(JNIEnv * env, jclass, jint ordering, jboolean btf, jint scale,
                                                                               jdouble tol, jint check, jdouble rcondThreshold) {
     try {
-        if (ordering < 0 || ordering > ORDERING_MINIMUM_FILL) {
-            throw std::runtime_error("Invalid KLU ordering " + std::to_string(ordering));
-        }
-        if (scale < -1 || scale > 2) {
-            throw std::runtime_error("Invalid KLU scaling " + std::to_string(scale));
-        }
-        if (check < CHECK_RGROWTH || check > CHECK_NONE) {
-            throw std::runtime_error("Invalid KLU refactorization check " + std::to_string(check));
-        }
-        KluParameters parameters;
-        parameters.ordering = ordering;
-        parameters.btf = btf == JNI_TRUE;
-        parameters.scale = scale;
-        parameters.tol = tol;
-        parameters.check = check;
-        parameters.rcondThreshold = rcondThreshold;
+        KluParameters parameters = checkedParameters(ordering, btf, scale, tol, check, rcondThreshold);
         std::lock_guard<std::mutex> lk(DEFAULT_PARAMETERS_MUTEX);
         DEFAULT_PARAMETERS = parameters;
     } catch (const std::exception& e) {
